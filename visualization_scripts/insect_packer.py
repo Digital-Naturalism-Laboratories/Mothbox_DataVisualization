@@ -11,10 +11,11 @@ Usage:
 
 Requirements:
     pip install Pillow numpy scipy
+Optional (for clustering):
+    pip install torch torchvision timm hdbscan
 """
 
 import argparse
-import os
 import random
 import time
 from pathlib import Path
@@ -22,6 +23,18 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_dilation
+
+# Optional perceptual clustering
+try:
+    import torch
+    import torchvision.transforms as T
+    import hdbscan
+    import timm
+    CLUSTERING_AVAILABLE = True
+except ImportError:
+    CLUSTERING_AVAILABLE = False
+    print("⚠  torch / torchvision / timm / hdbscan not found — clustering disabled.")
+    print("   pip install torch torchvision timm hdbscan")
 
 # ─────────────────────────────────────────────
 # INPUT FOLDER  ← set this to your insects directory
@@ -31,49 +44,26 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # ─────────────────────────────────────────────
 # Configuration defaults
 # ─────────────────────────────────────────────
-DEFAULT_CANVAS  = 6000      # canvas width & height in pixels
-DEFAULT_SCALE   = 1.0       # scale factor applied to each insect image
-DEFAULT_PADDING = 3         # extra transparent pixels around each insect mask
-MAX_ATTEMPTS    = 500       # placement attempts per image before giving up
-ALPHA_THRESHOLD = 20        # alpha value below this → transparent (background)
-SEED            = 42
-OUTLINE_ENABLED   = True        # draw a coloured outline around each insect
-OUTLINE_MODE      = "both"      # "outline_only" | "photo_only" | "both"
-OUTLINE_THICKNESS = 5.0         # multiplier on padding for stroke width (1.0 = same as padding)
+DEFAULT_CANVAS     = 7000     # canvas width & height in pixels
+DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
+DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
+MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
+ALPHA_THRESHOLD    = 50       # alpha value below this → transparent (background)
+SEED               = 42
+
+BACKGROUND_COLOR   = None     # None = transparent, or e.g. (255,255,255) for white
+OUTLINE_ENABLED    = False    # draw a coloured silhouette outline under each insect
+OUTLINE_MODE       = "both"   # "both" | "outline_only" | "photo_only"
+OUTLINE_THICKNESS  = 1.0      # stroke width as a multiplier of padding
+USE_CLUSTERING     = True    # cluster images perceptually before packing
+CLUSTER_BATCH_SIZE = 8        # images per embedding batch
+
 
 # ─────────────────────────────────────────────
-# Helpers
+# Image helpers
 # ─────────────────────────────────────────────
-def draw_outline(canvas_rgba: np.ndarray,
-                 mask: np.ndarray,
-                 row: int, col: int,
-                 thickness: int,
-                 color: tuple) -> None:
-    """
-    Draw a filled silhouette (dilated mask) in a random colour underneath
-    the insect, acting as a coloured outline/stroke.
-    """
-    from scipy.ndimage import binary_dilation
-    struct       = np.ones((thickness * 2 + 1, thickness * 2 + 1), dtype=bool)
-    outline_mask = binary_dilation(mask, structure=struct)
 
-    H, W   = canvas_rgba.shape[:2]
-    ih, iw = outline_mask.shape
-    r0 = max(0, row);       c0 = max(0, col)
-    r1 = min(H, row + ih);  c1 = min(W, col + iw)
-    mr0 = r0 - row;  mc0 = c0 - col
-    mr1 = r1 - row;  mc1 = c1 - col
-
-    region = outline_mask[mr0:mr1, mc0:mc1]
-    dst    = canvas_rgba[r0:r1, c0:c1]
-
-    # Only paint where outline exists but destination is transparent
-    paint = region & (dst[..., 3] == 0)
-    dst[paint] = [*color, 255]
-    canvas_rgba[r0:r1, c0:c1] = dst
-
-
-def load_image(path: Path, scale: float) -> Image.Image | None:
+def load_image(path: Path, scale: float):
     """Load a PNG/WebP/TIFF with alpha channel; resize if needed."""
     try:
         img = Image.open(path).convert("RGBA")
@@ -92,7 +82,7 @@ def get_mask(img: Image.Image, padding: int = DEFAULT_PADDING) -> np.ndarray:
     Return a boolean mask (True = insect pixel) derived from the alpha channel.
     A small dilation adds a 'padding' buffer so insects don't literally touch.
     """
-    alpha = np.array(img.split()[3])          # shape (H, W)
+    alpha = np.array(img.split()[3])
     mask  = alpha > ALPHA_THRESHOLD
     if padding > 0:
         struct = np.ones((padding * 2 + 1, padding * 2 + 1), dtype=bool)
@@ -100,38 +90,22 @@ def get_mask(img: Image.Image, padding: int = DEFAULT_PADDING) -> np.ndarray:
     return mask
 
 
-def bounding_box(mask: np.ndarray):
-    """Return (row_min, col_min, row_max, col_max) of the True region."""
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return rmin, cmin, rmax, cmax
-
-
 def masks_overlap(canvas_occ: np.ndarray,
                   insect_mask: np.ndarray,
                   row: int, col: int) -> bool:
-    """
-    Check whether placing insect_mask at (row, col) on canvas_occ
-    would overlap any already-occupied pixel.
-    """
+    """Check whether placing insect_mask at (row, col) overlaps occupied pixels."""
     H, W   = canvas_occ.shape
     ih, iw = insect_mask.shape
 
-    # Compute intersection between canvas area and insect mask
     r0 = max(0, row);       c0 = max(0, col)
     r1 = min(H, row + ih);  c1 = min(W, col + iw)
     if r1 <= r0 or c1 <= c0:
-        return True   # fully outside → treat as overlap (don't place off-canvas)
+        return True
 
     mr0 = r0 - row;  mc0 = c0 - col
     mr1 = r1 - row;  mc1 = c1 - col
 
-    canvas_region = canvas_occ[r0:r1, c0:c1]
-    insect_region = insect_mask[mr0:mr1, mc0:mc1]
-
-    return bool(np.any(canvas_region & insect_region))
+    return bool(np.any(canvas_occ[r0:r1, c0:c1] & insect_mask[mr0:mr1, mc0:mc1]))
 
 
 def stamp_mask(canvas_occ: np.ndarray,
@@ -158,11 +132,11 @@ def place_image(canvas_rgba: np.ndarray,
     mr0 = r0 - row;  mc0 = c0 - col
     mr1 = r1 - row;  mc1 = c1 - col
 
-    src  = np.array(img)[mr0:mr1, mc0:mc1].astype(float)   # (h, w, 4)
-    dst  = canvas_rgba[r0:r1, c0:c1].astype(float)
+    src = np.array(img)[mr0:mr1, mc0:mc1].astype(float)
+    dst = canvas_rgba[r0:r1, c0:c1].astype(float)
 
-    sa = src[..., 3:4] / 255.0
-    da = dst[..., 3:4] / 255.0
+    sa    = src[..., 3:4] / 255.0
+    da    = dst[..., 3:4] / 255.0
     out_a = sa + da * (1 - sa)
 
     with np.errstate(invalid='ignore', divide='ignore'):
@@ -172,11 +146,38 @@ def place_image(canvas_rgba: np.ndarray,
             0
         )
 
-    result       = np.zeros_like(dst)
+    result          = np.zeros_like(dst)
     result[..., :3] = np.clip(out_rgb, 0, 255)
     result[...,  3] = np.clip(out_a[..., 0] * 255, 0, 255)
     canvas_rgba[r0:r1, c0:c1] = result.astype(np.uint8)
 
+
+def draw_outline(canvas_rgba: np.ndarray,
+                 mask: np.ndarray,
+                 row: int, col: int,
+                 thickness: int,
+                 color: tuple) -> None:
+    """
+    Draw a filled silhouette (dilated mask) in a random colour underneath
+    the insect, acting as a coloured outline/stroke.
+    """
+    struct       = np.ones((thickness * 2 + 1, thickness * 2 + 1), dtype=bool)
+    outline_mask = binary_dilation(mask, structure=struct)
+
+    H, W   = canvas_rgba.shape[:2]
+    ih, iw = outline_mask.shape
+    r0 = max(0, row);       c0 = max(0, col)
+    r1 = min(H, row + ih);  c1 = min(W, col + iw)
+    mr0 = r0 - row;  mc0 = c0 - col
+    mr1 = r1 - row;  mc1 = c1 - col
+
+    region = outline_mask[mr0:mr1, mc0:mc1]
+    dst    = canvas_rgba[r0:r1, c0:c1]
+
+    # Only paint where the outline falls but the canvas is still empty
+    paint = region & (dst[..., 3] == 0)
+    dst[paint] = [*color, 255]
+    canvas_rgba[r0:r1, c0:c1] = dst
 
 
 # ─────────────────────────────────────────────
@@ -184,16 +185,11 @@ def place_image(canvas_rgba: np.ndarray,
 # ─────────────────────────────────────────────
 
 def spiral_positions(cx: int, cy: int, max_r: int, step: int = 6):
-    """
-    Yield (row, col) candidate positions in an Archimedean spiral
-    outward from (cy, cx).  step controls density of the spiral.
-    """
-    r = 0
+    """Yield (row, col) in an Archimedean spiral outward from (cy, cx)."""
+    r     = 0
     theta = 0.0
     while r < max_r:
-        row = int(cy + r * np.sin(theta))
-        col = int(cx + r * np.cos(theta))
-        yield row, col
+        yield int(cy + r * np.sin(theta)), int(cx + r * np.cos(theta))
         theta += step / max(r, 1)
         r      = step * theta / (2 * np.pi)
 
@@ -214,11 +210,9 @@ def try_place(canvas_occ: np.ndarray,
     """
     H, W   = canvas_occ.shape
     ih, iw = mask.shape
-    # offset so the insect *centre* lands on the spiral point
     ro, co = ih // 2, iw // 2
-
-    max_r = max(H, W)
-    step  = max(4, min(ih, iw) // 4)
+    max_r  = max(H, W)
+    step   = max(4, min(ih, iw) // 4)
 
     attempts = 0
     for (sr, sc) in spiral_positions(cx, cy, max_r, step=step):
@@ -226,23 +220,141 @@ def try_place(canvas_occ: np.ndarray,
             break
         attempts += 1
 
-        # Small random jitter so identical sizes don't stack
-        jr = rng.randint(-step, step)
-        jc = rng.randint(-step, step)
+        jr  = rng.randint(-step, step)
+        jc  = rng.randint(-step, step)
         row = sr - ro + jr
         col = sc - co + jc
 
         if not masks_overlap(canvas_occ, mask, row, col):
             stamp_mask(canvas_occ, mask, row, col)
             if outline:
-                color = (rng.randint(30,255), rng.randint(30,255), rng.randint(30,255))
+                color = (rng.randint(30, 255), rng.randint(30, 255), rng.randint(30, 255))
                 draw_outline(canvas_rgba, mask, row, col, outline_thickness, color)
             if outline_mode != "outline_only":
                 place_image(canvas_rgba, img, row, col)
             return True
 
-
     return False
+
+
+# ─────────────────────────────────────────────
+# Perceptual clustering
+# ─────────────────────────────────────────────
+
+def extract_embeddings_for_packing(image_files, batch_size=8):
+    """Extract DINOv2 or histogram embeddings for a list of image paths."""
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model  = timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True)
+        model  = model.to(device).eval()
+        transform = T.Compose([
+            T.Resize(518), T.CenterCrop(518), T.ToTensor(),
+            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        embeddings = []
+        for i in range(0, len(image_files), batch_size):
+            batch = []
+            for p in image_files[i:i + batch_size]:
+                try:
+                    batch.append(transform(Image.open(p).convert("RGB")))
+                except Exception:
+                    batch.append(torch.zeros(3, 518, 518))
+            with torch.no_grad():
+                feats = model(torch.stack(batch).to(device))
+            embeddings.extend(feats.cpu().numpy())
+            print(f"  Embeddings: {min(i + batch_size, len(image_files))}/{len(image_files)}", end="\r")
+        print()
+        return np.array(embeddings)
+
+    except Exception as e:
+        print(f"  ⚠ DINOv2 unavailable ({e}), using histogram embeddings.")
+        result = []
+        for p in image_files:
+            try:
+                img = np.array(Image.open(p).convert("RGB").resize((64, 64)),
+                               dtype=np.float32) / 255.0
+                hist = np.concatenate([
+                    np.histogram(img[:, :, c], bins=32, range=(0, 1))[0].astype(np.float32)
+                    for c in range(3)
+                ])
+                norm = np.linalg.norm(hist)
+                result.append(hist / norm if norm > 0 else hist)
+            except Exception:
+                result.append(np.zeros(96, dtype=np.float32))
+        return np.array(result)
+
+
+def save_cluster_cache(vis_dir: Path, path_label_pairs: list) -> None:
+    """Save clustering results to a JSON cache in the visualizations folder."""
+    import json
+    cache = {str(p): int(l) for p, l in path_label_pairs}
+    cache_path = vis_dir / "cluster_cache.json"
+    with open(cache_path, "w") as f:
+        json.dump(cache, f, indent=2)
+    print(f"✓ Cluster cache saved → {cache_path}")
+
+
+def load_cluster_cache(vis_dir: Path, paths: list):
+    """
+    Load cluster labels from cache if it exists and covers all current paths.
+    Returns (sorted_paths, labels) on hit, or None on miss.
+    """
+    import json
+    cache_path = vis_dir / "cluster_cache.json"
+    if not cache_path.exists():
+        return None
+
+    with open(cache_path, "r") as f:
+        cache = json.load(f)
+
+    path_strs = [str(p) for p in paths]
+    if not all(ps in cache for ps in path_strs):
+        print("⚠  Cluster cache exists but doesn't cover all current images — re-clustering.")
+        return None
+
+    print(f"✓ Loaded cluster cache from {cache_path}  ({len(cache)} entries)")
+    labels = [cache[ps] for ps in path_strs]
+    paired = sorted(zip(labels, paths), key=lambda x: (x[0] == -1, x[0]))
+    return [p for _, p in paired], labels
+
+
+def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
+    """
+    Cluster image paths perceptually with HDBSCAN, then return them
+    sorted by cluster label so visually similar insects are packed together.
+    Noise points (label -1) are appended at the end.
+
+    If vis_dir is provided, checks for a saved cluster cache first and
+    saves a new one after clustering.
+    """
+    # ── Try cache first ──────────────────────
+    if vis_dir is not None:
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        cached = load_cluster_cache(vis_dir, paths)
+        if cached is not None:
+            return cached
+
+    # ── Full clustering ──────────────────────
+    print(f"Extracting embeddings for {len(paths)} images...")
+    embeddings = extract_embeddings_for_packing([str(p) for p in paths], batch_size)
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=3, min_samples=1,
+        cluster_selection_epsilon=0.05, metric="euclidean"
+    )
+    labels = clusterer.fit_predict(embeddings)
+
+    n_clusters = len(set(labels) - {-1})
+    n_noise    = int(np.sum(labels == -1))
+    print(f"✓ Found {n_clusters} perceptual clusters ({n_noise} unique/noise images)")
+
+    # ── Save cache ───────────────────────────
+    if vis_dir is not None:
+        save_cluster_cache(vis_dir, list(zip(paths, labels)))
+
+    # Sort: cluster 0, 1, 2 … noise (-1) last
+    paired = sorted(zip(labels, paths), key=lambda x: (x[0] == -1, x[0]))
+    return [p for _, p in paired], labels
 
 
 # ─────────────────────────────────────────────
@@ -251,33 +363,37 @@ def try_place(canvas_occ: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pack insect images onto a transparent canvas using shape packing."
+        description="Pack insect images onto a canvas using shape packing."
     )
-    parser.add_argument("--outline",           action="store_true", default=OUTLINE_ENABLED,
-                    help="Draw a random-coloured outline around each insect.")
-    parser.add_argument("--outline-mode",      default=OUTLINE_MODE,
-                        choices=["both", "outline_only", "photo_only"],
-                        help="What to render. (default: both)")
-    parser.add_argument("--outline-thickness", type=float, default=OUTLINE_THICKNESS,
-                        help="Stroke width as a multiplier of padding. (default: 1.0)")
     parser.add_argument("--input",    "-i", default=INPUT_FOLDER,
                         help="Folder containing insect images. (default: INPUT_FOLDER global)")
     parser.add_argument("--output",   "-o", default="insect_packed.png",
-                        help="Output PNG file path. (default: insect_packed.png)")
-    parser.add_argument("--canvas",   "-c", type=int, default=DEFAULT_CANVAS,
+                        help="Output PNG filename. Saved into <input>/visualizations/. (default: insect_packed.png)")
+    parser.add_argument("--canvas",   "-c", type=int,   default=DEFAULT_CANVAS,
                         help=f"Canvas size in pixels (square). (default: {DEFAULT_CANVAS})")
     parser.add_argument("--scale",    "-s", type=float, default=DEFAULT_SCALE,
                         help=f"Scale factor for input images. (default: {DEFAULT_SCALE})")
-    parser.add_argument("--padding",  "-p", type=int, default=DEFAULT_PADDING,
+    parser.add_argument("--padding",  "-p", type=int,   default=DEFAULT_PADDING,
                         help=f"Pixel gap between packed insects. (default: {DEFAULT_PADDING})")
-    parser.add_argument("--attempts", "-a", type=int, default=MAX_ATTEMPTS,
+    parser.add_argument("--attempts", "-a", type=int,   default=MAX_ATTEMPTS,
                         help=f"Max placement attempts per insect. (default: {MAX_ATTEMPTS})")
-    parser.add_argument("--limit",    "-l", type=int, default=None,
+    parser.add_argument("--limit",    "-l", type=int,   default=None,
                         help="Max number of images to pack (default: all).")
-    parser.add_argument("--seed",           type=int, default=SEED,
+    parser.add_argument("--seed",           type=int,   default=SEED,
                         help=f"Random seed. (default: {SEED})")
     parser.add_argument("--shuffle",        action="store_true",
-                        help="Shuffle image order before packing.")
+                        help="Shuffle image order before packing (ignored if --cluster is set).")
+    parser.add_argument("--background", "-b", default=None,
+                        help="Background colour as R,G,B (e.g. 255,255,255 for white). Default: transparent.")
+    parser.add_argument("--outline",        action="store_true", default=OUTLINE_ENABLED,
+                        help="Draw a random-coloured silhouette outline under each insect.")
+    parser.add_argument("--outline-mode",   default=OUTLINE_MODE,
+                        choices=["both", "outline_only", "photo_only"],
+                        help="What to render: both, outline_only, or photo_only. (default: both)")
+    parser.add_argument("--outline-thickness", type=float, default=OUTLINE_THICKNESS,
+                        help="Stroke width as a multiplier of padding. (default: 1.0)")
+    parser.add_argument("--cluster",        action="store_true", default=USE_CLUSTERING,
+                        help="Cluster images perceptually before packing so similar insects are grouped.")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -286,12 +402,23 @@ def main():
     # ── Collect image paths ──────────────────
     input_dir = Path(args.input)
     exts      = {".png", ".webp", ".tif", ".tiff", ".jpg", ".jpeg"}
-    paths     = sorted([p for p in input_dir.rglob("*") if p.suffix.lower() in exts])
+    paths     = sorted([p for p in input_dir.rglob("*")
+                        if p.suffix.lower() in exts
+                        and "visualizations" not in p.parts])   # don't re-pack old outputs
     if not paths:
         print(f"No images found in {input_dir}")
         return
 
-    if args.shuffle:
+    # ── Ordering ────────────────────────────
+    vis_dir = Path(args.input) / "visualizations"
+    if args.cluster:
+        if CLUSTERING_AVAILABLE:
+            print("Clustering images before packing...")
+            paths, _ = cluster_and_sort_paths(paths, batch_size=CLUSTER_BATCH_SIZE,
+                                              vis_dir=vis_dir)
+        else:
+            print("⚠  Clustering requested but dependencies are missing — falling back to sorted order.")
+    elif args.shuffle:
         rng.shuffle(paths)
 
     if args.limit:
@@ -303,39 +430,45 @@ def main():
     C  = args.canvas
     cx = cy = C // 2
 
-    canvas_rgba = np.zeros((C, C, 4), dtype=np.uint8)   # RGBA, all transparent
-    canvas_occ  = np.zeros((C, C),    dtype=bool)        # occupancy map
+    canvas_rgba = np.zeros((C, C, 4), dtype=np.uint8)
+    canvas_occ  = np.zeros((C, C),    dtype=bool)
+
+    # Fill background colour if specified
+    bg = args.background or BACKGROUND_COLOR
+    if bg is not None:
+        if isinstance(bg, str):
+            bg = tuple(int(x) for x in bg.split(","))
+        canvas_rgba[:, :, :3] = bg
+        canvas_rgba[:, :,  3] = 255
 
     # ── Pack images ──────────────────────────
-    placed = 0
+    outline_px = max(1, int(args.padding * args.outline_thickness))
+    placed  = 0
     skipped = 0
-    t0 = time.time()
+    t0      = time.time()
 
     for idx, path in enumerate(paths):
-        img  = load_image(path, args.scale)
+        img = load_image(path, args.scale)
         if img is None:
             skipped += 1
             continue
 
         mask = get_mask(img, padding=args.padding)
-
-        # Skip fully-transparent images
         if not mask.any():
             skipped += 1
             continue
 
         ok = try_place(canvas_occ, canvas_rgba, img, mask,
-                            cx, cy, args.attempts, rng,
-                            outline=args.outline,
-                            outline_thickness=max(1, int(args.padding * args.outline_thickness)),
-                            outline_mode=args.outline_mode)
+                       cx, cy, args.attempts, rng,
+                       outline=args.outline,
+                       outline_thickness=outline_px,
+                       outline_mode=args.outline_mode)
 
         if ok:
             placed += 1
         else:
             skipped += 1
 
-        # Progress
         if (idx + 1) % 50 == 0 or (idx + 1) == len(paths):
             elapsed = time.time() - t0
             pct     = 100 * (idx + 1) / len(paths)
@@ -344,14 +477,16 @@ def main():
                   f"elapsed={elapsed:.1f}s")
 
     # ── Save ─────────────────────────────────
-    out_path = Path(args.output)
-    mode_tag = "" if not args.outline else f"_{args.outline_mode}"
-    suffix = f"_c{args.canvas}_s{args.scale}_p{args.padding}{mode_tag}"
-    out_path = out_path.with_stem(out_path.stem + suffix)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
 
-    result = Image.fromarray(canvas_rgba, "RGBA")
-    result.save(out_path, "PNG")
+    mode_tag    = f"_{args.outline_mode}" if args.outline else ""
+    cluster_tag = "_clustered" if args.cluster else ""
+    suffix      = f"_c{args.canvas}_s{args.scale}_p{args.padding}{mode_tag}{cluster_tag}"
+
+    out_path = Path(args.output)
+    out_path = vis_dir / out_path.with_stem(out_path.stem + suffix).name
+
+    Image.fromarray(canvas_rgba, "RGBA").save(out_path, "PNG")
     print(f"\n✓ Saved → {out_path}  ({placed} insects packed, {skipped} skipped)")
     print(f"  Total time: {time.time() - t0:.1f}s")
 
