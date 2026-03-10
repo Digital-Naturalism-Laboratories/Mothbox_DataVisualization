@@ -6,8 +6,9 @@ Places insect images (with transparent backgrounds) onto a large canvas,
 packing them tightly together using their actual silhouette edges.
 
 Usage:
-    python insect_packer.py --input ./insects --output packed.png
-    python insect_packer.py --input ./insects --output packed.png --canvas 4000 --scale 0.5
+    python insect_packer.py
+    python insect_packer.py --width 4000 --height 8000 --scale 0.5
+    python insect_packer.py --vertical --cluster --outline
 
 Requirements:
     pip install Pillow numpy scipy
@@ -33,7 +34,7 @@ try:
     CLUSTERING_AVAILABLE = True
 except ImportError:
     CLUSTERING_AVAILABLE = False
-    print("⚠  torch / torchvision / timm / hdbscan not found — clustering disabled.")
+    print(" torch / torchvision / timm / hdbscan not found — clustering disabled.")
     print("   pip install torch torchvision timm hdbscan")
 
 # ─────────────────────────────────────────────
@@ -44,7 +45,8 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # ─────────────────────────────────────────────
 # Configuration defaults
 # ─────────────────────────────────────────────
-DEFAULT_CANVAS     = 7000     # canvas width & height in pixels
+DEFAULT_WIDTH      = 3000     # canvas width in pixels
+DEFAULT_HEIGHT     = 6000     # canvas height in pixels
 DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
 DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
 MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
@@ -57,6 +59,7 @@ OUTLINE_MODE       = "both"   # "both" | "outline_only" | "photo_only"
 OUTLINE_THICKNESS  = 1.0      # stroke width as a multiplier of padding
 USE_CLUSTERING     = True    # cluster images perceptually before packing
 CLUSTER_BATCH_SIZE = 8        # images per embedding batch
+VERTICAL_STACK     = True    # pack insects top-to-bottom constrained by width
 
 
 # ─────────────────────────────────────────────
@@ -181,7 +184,7 @@ def draw_outline(canvas_rgba: np.ndarray,
 
 
 # ─────────────────────────────────────────────
-# Placement strategy: spiral outward from centre
+# Placement strategy 1: spiral outward from centre
 # ─────────────────────────────────────────────
 
 def spiral_positions(cx: int, cy: int, max_r: int, step: int = 6):
@@ -232,6 +235,64 @@ def try_place(canvas_occ: np.ndarray,
                 draw_outline(canvas_rgba, mask, row, col, outline_thickness, color)
             if outline_mode != "outline_only":
                 place_image(canvas_rgba, img, row, col)
+            return True
+
+    return False
+
+
+# ─────────────────────────────────────────────
+# Placement strategy 2: vertical stack
+# ─────────────────────────────────────────────
+
+def try_place_vertical(canvas_occ: np.ndarray,
+                       canvas_rgba: np.ndarray,
+                       img: Image.Image,
+                       mask: np.ndarray,
+                       cursor: list,
+                       rng: random.Random,
+                       outline: bool = False,
+                       outline_thickness: int = 2,
+                       outline_mode: str = "both") -> bool:
+    """
+    Place img in a left-to-right, top-to-bottom flow constrained by canvas width.
+    cursor[0] tracks the Y position of the current row's top edge.
+    Falls back to starting a new row when no horizontal space remains.
+    """
+    H, W   = canvas_occ.shape
+    ih, iw = mask.shape
+
+    if ih > H or iw > W:
+        return False  # insect is too large for the canvas
+
+    def _stamp_and_paint(y, x):
+        stamp_mask(canvas_occ, mask, y, x)
+        if outline:
+            color = (rng.randint(30, 255), rng.randint(30, 255), rng.randint(30, 255))
+            draw_outline(canvas_rgba, mask, y, x, outline_thickness, color)
+        if outline_mode != "outline_only":
+            place_image(canvas_rgba, img, y, x)
+        cursor[0] = max(cursor[0], y + ih)
+
+    # Try placing in the current row with a small vertical jitter
+    jitter = rng.randint(-2, 2)
+    y = max(0, min(cursor[0] + jitter, H - ih))
+    for x in range(0, W - iw + 1, max(1, iw // 8)):
+        if not masks_overlap(canvas_occ, mask, y, x):
+            _stamp_and_paint(y, x)
+            return True
+
+    # Current row is full — find the next free row by scanning the centre column
+    centre_col = min(W // 2, W - 1)
+    occupied_rows = np.where(canvas_occ[:, centre_col])[0]
+    new_y = int(occupied_rows[-1]) + 1 if len(occupied_rows) else 0
+    if new_y + ih > H:
+        return False  # canvas is full
+
+    cursor[0] = new_y
+    y = new_y
+    for x in range(0, W - iw + 1, max(1, iw // 8)):
+        if not masks_overlap(canvas_occ, mask, y, x):
+            _stamp_and_paint(y, x)
             return True
 
     return False
@@ -369,8 +430,10 @@ def main():
                         help="Folder containing insect images. (default: INPUT_FOLDER global)")
     parser.add_argument("--output",   "-o", default="insect_packed.png",
                         help="Output PNG filename. Saved into <input>/visualizations/. (default: insect_packed.png)")
-    parser.add_argument("--canvas",   "-c", type=int,   default=DEFAULT_CANVAS,
-                        help=f"Canvas size in pixels (square). (default: {DEFAULT_CANVAS})")
+    parser.add_argument("--width",    "-W", type=int,   default=DEFAULT_WIDTH,
+                        help=f"Canvas width in pixels. (default: {DEFAULT_WIDTH})")
+    parser.add_argument("--height",   "-H", type=int,   default=DEFAULT_HEIGHT,
+                        help=f"Canvas height in pixels. (default: {DEFAULT_HEIGHT})")
     parser.add_argument("--scale",    "-s", type=float, default=DEFAULT_SCALE,
                         help=f"Scale factor for input images. (default: {DEFAULT_SCALE})")
     parser.add_argument("--padding",  "-p", type=int,   default=DEFAULT_PADDING,
@@ -381,8 +444,8 @@ def main():
                         help="Max number of images to pack (default: all).")
     parser.add_argument("--seed",           type=int,   default=SEED,
                         help=f"Random seed. (default: {SEED})")
-    parser.add_argument("--shuffle",        action="store_true",
-                        help="Shuffle image order before packing (ignored if --cluster is set).")
+    parser.add_argument("--no-shuffle",     action="store_true",
+                        help="Disable the default random shuffling of images (ignored if --cluster is set).")
     parser.add_argument("--background", "-b", default=None,
                         help="Background colour as R,G,B (e.g. 255,255,255 for white). Default: transparent.")
     parser.add_argument("--outline",        action="store_true", default=OUTLINE_ENABLED,
@@ -394,6 +457,8 @@ def main():
                         help="Stroke width as a multiplier of padding. (default: 1.0)")
     parser.add_argument("--cluster",        action="store_true", default=USE_CLUSTERING,
                         help="Cluster images perceptually before packing so similar insects are grouped.")
+    parser.add_argument("--vertical",       action="store_true", default=VERTICAL_STACK,
+                        help="Pack insects in a vertical stack constrained by canvas width, top to bottom.")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -404,7 +469,7 @@ def main():
     exts      = {".png", ".webp", ".tif", ".tiff", ".jpg", ".jpeg"}
     paths     = sorted([p for p in input_dir.rglob("*")
                         if p.suffix.lower() in exts
-                        and "visualizations" not in p.parts])   # don't re-pack old outputs
+                        and "visualizations" not in p.parts])
     if not paths:
         print(f"No images found in {input_dir}")
         return
@@ -417,21 +482,26 @@ def main():
             paths, _ = cluster_and_sort_paths(paths, batch_size=CLUSTER_BATCH_SIZE,
                                               vis_dir=vis_dir)
         else:
-            print("⚠  Clustering requested but dependencies are missing — falling back to sorted order.")
-    elif args.shuffle:
-        rng.shuffle(paths)
+            print("⚠  Clustering requested but dependencies are missing — falling back to random order.")
+            rng.shuffle(paths)
+    else:
+        if not args.no_shuffle:
+            rng.shuffle(paths)
 
     if args.limit:
         paths = paths[: args.limit]
 
-    print(f"Found {len(paths)} images  |  canvas {args.canvas}×{args.canvas}  |  scale {args.scale}")
+    print(f"Found {len(paths)} images  |  {args.width}×{args.height}px  |  scale {args.scale}"
+          + ("  |  vertical stack" if args.vertical else "  |  radial spiral"))
 
     # ── Allocate canvas ──────────────────────
-    C  = args.canvas
-    cx = cy = C // 2
+    W  = args.width
+    H  = args.height
+    cx = W // 2
+    cy = H // 2
 
-    canvas_rgba = np.zeros((C, C, 4), dtype=np.uint8)
-    canvas_occ  = np.zeros((C, C),    dtype=bool)
+    canvas_rgba = np.zeros((H, W, 4), dtype=np.uint8)
+    canvas_occ  = np.zeros((H, W),    dtype=bool)
 
     # Fill background colour if specified
     bg = args.background or BACKGROUND_COLOR
@@ -443,6 +513,7 @@ def main():
 
     # ── Pack images ──────────────────────────
     outline_px = max(1, int(args.padding * args.outline_thickness))
+    cursor  = [0]   # vertical stack mode — tracks current Y position
     placed  = 0
     skipped = 0
     t0      = time.time()
@@ -458,11 +529,18 @@ def main():
             skipped += 1
             continue
 
-        ok = try_place(canvas_occ, canvas_rgba, img, mask,
-                       cx, cy, args.attempts, rng,
-                       outline=args.outline,
-                       outline_thickness=outline_px,
-                       outline_mode=args.outline_mode)
+        if args.vertical:
+            ok = try_place_vertical(canvas_occ, canvas_rgba, img, mask,
+                                    cursor, rng,
+                                    outline=args.outline,
+                                    outline_thickness=outline_px,
+                                    outline_mode=args.outline_mode)
+        else:
+            ok = try_place(canvas_occ, canvas_rgba, img, mask,
+                           cx, cy, args.attempts, rng,
+                           outline=args.outline,
+                           outline_thickness=outline_px,
+                           outline_mode=args.outline_mode)
 
         if ok:
             placed += 1
@@ -481,7 +559,8 @@ def main():
 
     mode_tag    = f"_{args.outline_mode}" if args.outline else ""
     cluster_tag = "_clustered" if args.cluster else ""
-    suffix      = f"_c{args.canvas}_s{args.scale}_p{args.padding}{mode_tag}{cluster_tag}"
+    layout_tag  = "_vertical" if args.vertical else ""
+    suffix      = f"_w{args.width}_h{args.height}_s{args.scale}_p{args.padding}{mode_tag}{cluster_tag}{layout_tag}"
 
     out_path = Path(args.output)
     out_path = vis_dir / out_path.with_stem(out_path.stem + suffix).name
