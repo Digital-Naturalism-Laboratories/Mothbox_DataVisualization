@@ -45,21 +45,23 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # ─────────────────────────────────────────────
 # Configuration defaults
 # ─────────────────────────────────────────────
-DEFAULT_WIDTH      = 7000     # canvas width in pixels
+DEFAULT_WIDTH      = 8000     # canvas width in pixels
 DEFAULT_HEIGHT     = 6000     # canvas height in pixels
 DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
 DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
 MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
-ALPHA_THRESHOLD    = 40       # alpha value below this → transparent (background)
+ALPHA_THRESHOLD    = 50       # alpha value below this → transparent (background)
 SEED               = 42
 
 BACKGROUND_COLOR   = None     # None = transparent, or e.g. (255,255,255) for white
 OUTLINE_ENABLED    = False    # draw a coloured silhouette outline under each insect
 OUTLINE_MODE       = "both"   # "both" | "outline_only" | "photo_only"
 OUTLINE_THICKNESS  = 1.0      # stroke width as a multiplier of padding
-USE_CLUSTERING     = True    # cluster images perceptually before packing
+USE_CLUSTERING     = False    # cluster images perceptually before packing
 CLUSTER_BATCH_SIZE = 8        # images per embedding batch
-VERTICAL_STACK     = False    # pack insects top-to-bottom constrained by width
+VERTICAL_STACK        = False    # pack insects top-to-bottom constrained by width
+SORT_CLUSTERS_BY_SIZE = True     # sort clusters by image area before packing
+SORT_SIZE_DESCENDING  = True     # True = largest cluster first, False = smallest first
 
 
 # ─────────────────────────────────────────────
@@ -368,7 +370,7 @@ def save_cluster_cache(vis_dir: Path, path_label_pairs: list) -> None:
     print(f"✓ Cluster cache saved → {cache_path}")
 
 
-def load_cluster_cache(vis_dir: Path, paths: list):
+def load_cluster_cache(vis_dir: Path, paths: list, descending: bool = True):
     """
     Load cluster labels from cache if it exists and covers all current paths.
     Returns (sorted_paths, labels) on hit, or None on miss.
@@ -401,7 +403,7 @@ def get_image_area(path: Path) -> int:
         return 0
 
 
-def sort_clusters_by_size(label_path_pairs: list) -> tuple:
+def sort_clusters_by_size(label_path_pairs: list, descending: bool = True) -> tuple:
     """
     Sort clusters so the largest cluster (by area of its first image) comes first,
     smallest last. Noise points (label -1) are always appended at the end.
@@ -420,7 +422,7 @@ def sort_clusters_by_size(label_path_pairs: list) -> tuple:
     def cluster_area(items):
         return get_image_area(items[0][1])
 
-    sorted_clusters = sorted(clusters.values(), key=cluster_area, reverse=True)
+    sorted_clusters = sorted(clusters.values(), key=cluster_area, reverse=descending)
 
     ordered       = [pair for cluster in sorted_clusters for pair in cluster] + noise
     sorted_paths  = [p for _, p in ordered]
@@ -428,7 +430,7 @@ def sort_clusters_by_size(label_path_pairs: list) -> tuple:
     return sorted_paths, sorted_labels
 
 
-def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
+def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None, descending: bool = True):
     """
     Cluster image paths perceptually with HDBSCAN, then return them
     sorted by cluster label so visually similar insects are packed together.
@@ -440,7 +442,7 @@ def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
     # ── Try cache first ──────────────────────
     if vis_dir is not None:
         vis_dir.mkdir(parents=True, exist_ok=True)
-        cached = load_cluster_cache(vis_dir, paths)
+        cached = load_cluster_cache(vis_dir, paths, descending=descending)
         if cached is not None:
             return cached
 
@@ -462,8 +464,8 @@ def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
     if vis_dir is not None:
         save_cluster_cache(vis_dir, list(zip(paths, labels)))
 
-    # Sort clusters by size (largest first), noise last
-    sorted_paths, sorted_labels = sort_clusters_by_size(list(zip(labels, paths)))
+    # Sort clusters by size, noise last
+    sorted_paths, sorted_labels = sort_clusters_by_size(list(zip(labels, paths)), descending=descending)
     return sorted_paths, sorted_labels
 
 
@@ -508,6 +510,10 @@ def main():
                         help="Cluster images perceptually before packing so similar insects are grouped.")
     parser.add_argument("--vertical",       action="store_true", default=VERTICAL_STACK,
                         help="Pack insects in a vertical stack constrained by canvas width, top to bottom.")
+    parser.add_argument("--sort-by-size",     action="store_true", default=SORT_CLUSTERS_BY_SIZE,
+                        help="Sort clusters by the area of their first image before packing.")
+    parser.add_argument("--sort-ascending",   action="store_true",
+                        help="Sort clusters smallest-first instead of largest-first (only applies with --sort-by-size).")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -528,8 +534,10 @@ def main():
     if args.cluster:
         if CLUSTERING_AVAILABLE:
             print("Clustering images before packing...")
+            do_descending = (not args.sort_ascending) if args.sort_by_size else True
             paths, _ = cluster_and_sort_paths(paths, batch_size=CLUSTER_BATCH_SIZE,
-                                              vis_dir=vis_dir)
+                                              vis_dir=vis_dir,
+                                              descending=do_descending)
         else:
             print("⚠  Clustering requested but dependencies are missing — falling back to random order.")
             rng.shuffle(paths)
@@ -564,18 +572,19 @@ def main():
     outline_px = max(1, int(args.padding * args.outline_thickness))
     cursor  = [0, 0, 0]   # vertical stack: [shelf_y, shelf_x, shelf_tallest]
     placed  = 0
-    skipped = 0
+    invalid = 0   # corrupted, missing, or fully transparent
+    no_fit  = 0   # valid image but couldn't be placed on canvas
     t0      = time.time()
 
     for idx, path in enumerate(paths):
         img = load_image(path, args.scale)
         if img is None:
-            skipped += 1
+            invalid += 1
             continue
 
         mask = get_mask(img, padding=args.padding)
         if not mask.any():
-            skipped += 1
+            invalid += 1
             continue
 
         if args.vertical:
@@ -594,13 +603,13 @@ def main():
         if ok:
             placed += 1
         else:
-            skipped += 1
+            no_fit += 1
 
         if (idx + 1) % 50 == 0 or (idx + 1) == len(paths):
             elapsed = time.time() - t0
             pct     = 100 * (idx + 1) / len(paths)
             print(f"  [{idx+1:>5}/{len(paths)}]  {pct:5.1f}%  "
-                  f"placed={placed}  skipped={skipped}  "
+                  f"placed={placed}  invalid={invalid}  no_fit={no_fit}  "
                   f"elapsed={elapsed:.1f}s")
 
     # ── Save ─────────────────────────────────
