@@ -46,11 +46,11 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # Configuration defaults
 # ─────────────────────────────────────────────
 DEFAULT_WIDTH      = 7000     # canvas width in pixels
-DEFAULT_HEIGHT     = 7000     # canvas height in pixels
-DEFAULT_SCALE      = 1.      # scale factor applied to each insect image
+DEFAULT_HEIGHT     = 6000     # canvas height in pixels
+DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
 DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
 MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
-ALPHA_THRESHOLD    = 50       # alpha value below this → transparent (background)
+ALPHA_THRESHOLD    = 40       # alpha value below this → transparent (background)
 SEED               = 42
 
 BACKGROUND_COLOR   = None     # None = transparent, or e.g. (255,255,255) for white
@@ -388,8 +388,44 @@ def load_cluster_cache(vis_dir: Path, paths: list):
 
     print(f"✓ Loaded cluster cache from {cache_path}  ({len(cache)} entries)")
     labels = [cache[ps] for ps in path_strs]
-    paired = sorted(zip(labels, paths), key=lambda x: (x[0] == -1, x[0]))
-    return [p for _, p in paired], labels
+    sorted_paths, sorted_labels = sort_clusters_by_size(list(zip(labels, paths)))
+    return sorted_paths, sorted_labels
+
+
+def get_image_area(path: Path) -> int:
+    """Return the number of non-transparent pixels in an image (its visual area)."""
+    try:
+        alpha = np.array(Image.open(path).convert("RGBA").split()[3])
+        return int(np.sum(alpha > ALPHA_THRESHOLD))
+    except Exception:
+        return 0
+
+
+def sort_clusters_by_size(label_path_pairs: list) -> tuple:
+    """
+    Sort clusters so the largest cluster (by area of its first image) comes first,
+    smallest last. Noise points (label -1) are always appended at the end.
+    Within each cluster, images keep their original relative order.
+    """
+    from collections import defaultdict
+
+    clusters = defaultdict(list)
+    noise    = []
+    for label, path in label_path_pairs:
+        if label == -1:
+            noise.append((label, path))
+        else:
+            clusters[label].append((label, path))
+
+    def cluster_area(items):
+        return get_image_area(items[0][1])
+
+    sorted_clusters = sorted(clusters.values(), key=cluster_area, reverse=True)
+
+    ordered       = [pair for cluster in sorted_clusters for pair in cluster] + noise
+    sorted_paths  = [p for _, p in ordered]
+    sorted_labels = [l for l, _ in ordered]
+    return sorted_paths, sorted_labels
 
 
 def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
@@ -426,9 +462,9 @@ def cluster_and_sort_paths(paths, batch_size=8, vis_dir: Path = None):
     if vis_dir is not None:
         save_cluster_cache(vis_dir, list(zip(paths, labels)))
 
-    # Sort: cluster 0, 1, 2 … noise (-1) last
-    paired = sorted(zip(labels, paths), key=lambda x: (x[0] == -1, x[0]))
-    return [p for _, p in paired], labels
+    # Sort clusters by size (largest first), noise last
+    sorted_paths, sorted_labels = sort_clusters_by_size(list(zip(labels, paths)))
+    return sorted_paths, sorted_labels
 
 
 # ─────────────────────────────────────────────
