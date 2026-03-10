@@ -61,7 +61,7 @@ USE_CLUSTERING     = False    # cluster images perceptually before packing
 CLUSTER_BATCH_SIZE = 8        # images per embedding batch
 VERTICAL_STACK        = False    # pack insects top-to-bottom constrained by width
 SORT_CLUSTERS_BY_SIZE = True     # sort clusters by image area before packing
-SORT_SIZE_DESCENDING  = True     # True = largest cluster first, False = smallest first
+SORT_SIZE_DESCENDING  = False     # True = largest cluster first, False = smallest first
 
 
 # ─────────────────────────────────────────────
@@ -624,7 +624,8 @@ def main():
     out_path = vis_dir / out_path.with_stem(out_path.stem + suffix).name
 
     Image.fromarray(canvas_rgba, "RGBA").save(out_path, "PNG")
-    print(f"\n✓ Saved → {out_path}  ({placed} insects packed, {skipped} skipped)")
+    print(f"\n✓ Saved → {out_path}")
+    print(f"  placed={placed}  |  invalid/transparent={invalid}  |  couldn't fit={no_fit}")    
     print(f"  Total time: {time.time() - t0:.1f}s")
 
 
