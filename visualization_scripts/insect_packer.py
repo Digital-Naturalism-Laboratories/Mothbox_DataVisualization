@@ -34,7 +34,7 @@ try:
     CLUSTERING_AVAILABLE = True
 except ImportError:
     CLUSTERING_AVAILABLE = False
-    print(" torch / torchvision / timm / hdbscan not found — clustering disabled.")
+    print("⚠  torch / torchvision / timm / hdbscan not found — clustering disabled.")
     print("   pip install torch torchvision timm hdbscan")
 
 # ─────────────────────────────────────────────
@@ -45,9 +45,9 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # ─────────────────────────────────────────────
 # Configuration defaults
 # ─────────────────────────────────────────────
-DEFAULT_WIDTH      = 3000     # canvas width in pixels
-DEFAULT_HEIGHT     = 6000     # canvas height in pixels
-DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
+DEFAULT_WIDTH      = 7000     # canvas width in pixels
+DEFAULT_HEIGHT     = 7000     # canvas height in pixels
+DEFAULT_SCALE      = 1.      # scale factor applied to each insect image
 DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
 MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
 ALPHA_THRESHOLD    = 50       # alpha value below this → transparent (background)
@@ -59,7 +59,7 @@ OUTLINE_MODE       = "both"   # "both" | "outline_only" | "photo_only"
 OUTLINE_THICKNESS  = 1.0      # stroke width as a multiplier of padding
 USE_CLUSTERING     = True    # cluster images perceptually before packing
 CLUSTER_BATCH_SIZE = 8        # images per embedding batch
-VERTICAL_STACK     = True    # pack insects top-to-bottom constrained by width
+VERTICAL_STACK     = False    # pack insects top-to-bottom constrained by width
 
 
 # ─────────────────────────────────────────────
@@ -254,9 +254,13 @@ def try_place_vertical(canvas_occ: np.ndarray,
                        outline_thickness: int = 2,
                        outline_mode: str = "both") -> bool:
     """
-    Place img in a left-to-right, top-to-bottom flow constrained by canvas width.
-    cursor[0] tracks the Y position of the current row's top edge.
-    Falls back to starting a new row when no horizontal space remains.
+    Shelf-packing: fills left-to-right across the canvas width, then starts a
+    new shelf below the tallest insect placed so far.
+
+    cursor layout:
+        cursor[0]  — Y top of the current shelf
+        cursor[1]  — X position of the next insect on the current shelf
+        cursor[2]  — tallest insect placed on the current shelf (drives next shelf Y)
     """
     H, W   = canvas_occ.shape
     ih, iw = mask.shape
@@ -271,29 +275,38 @@ def try_place_vertical(canvas_occ: np.ndarray,
             draw_outline(canvas_rgba, mask, y, x, outline_thickness, color)
         if outline_mode != "outline_only":
             place_image(canvas_rgba, img, y, x)
-        cursor[0] = max(cursor[0], y + ih)
 
-    # Try placing in the current row with a small vertical jitter
-    jitter = rng.randint(-2, 2)
-    y = max(0, min(cursor[0] + jitter, H - ih))
-    for x in range(0, W - iw + 1, max(1, iw // 8)):
-        if not masks_overlap(canvas_occ, mask, y, x):
-            _stamp_and_paint(y, x)
+    shelf_y    = cursor[0]
+    shelf_x    = cursor[1]
+    shelf_tall = cursor[2]
+
+    # Try every x position on the current shelf, scanning pixel-by-pixel
+    x = shelf_x
+    while x + iw <= W:
+        if not masks_overlap(canvas_occ, mask, shelf_y, x):
+            _stamp_and_paint(shelf_y, x)
+            cursor[1]  = x + iw          # advance X past this insect
+            cursor[2]  = max(shelf_tall, ih)  # track tallest on shelf
             return True
+        x += 1  # step one pixel at a time for tight packing
 
-    # Current row is full — find the next free row by scanning the centre column
-    centre_col = min(W // 2, W - 1)
-    occupied_rows = np.where(canvas_occ[:, centre_col])[0]
-    new_y = int(occupied_rows[-1]) + 1 if len(occupied_rows) else 0
+    # Current shelf is full — open a new shelf below
+    new_y = shelf_y + max(shelf_tall, 1)
     if new_y + ih > H:
         return False  # canvas is full
 
-    cursor[0] = new_y
-    y = new_y
-    for x in range(0, W - iw + 1, max(1, iw // 8)):
-        if not masks_overlap(canvas_occ, mask, y, x):
-            _stamp_and_paint(y, x)
+    cursor[0] = new_y   # new shelf top
+    cursor[1] = 0       # reset X to left edge
+    cursor[2] = 0       # reset shelf height tracker
+
+    x = 0
+    while x + iw <= W:
+        if not masks_overlap(canvas_occ, mask, new_y, x):
+            _stamp_and_paint(new_y, x)
+            cursor[1] = x + iw
+            cursor[2] = ih
             return True
+        x += 1
 
     return False
 
@@ -513,7 +526,7 @@ def main():
 
     # ── Pack images ──────────────────────────
     outline_px = max(1, int(args.padding * args.outline_thickness))
-    cursor  = [0]   # vertical stack mode — tracks current Y position
+    cursor  = [0, 0, 0]   # vertical stack: [shelf_y, shelf_x, shelf_tallest]
     placed  = 0
     skipped = 0
     t0      = time.time()
