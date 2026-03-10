@@ -48,10 +48,10 @@ except ImportError:
 INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\rembg"
 
 # ── Configuration defaults ────────────────────────────────────────────────────
-DEFAULT_WIDTH          = 6000    # canvas width in pixels (height is auto)
+DEFAULT_WIDTH          = 5000    # canvas width in pixels (height is auto)
 DEFAULT_SCALE          = 0.4     # scale applied to each insect before packing
 DEFAULT_PADDING        = 2       # extra transparent pixels around each silhouette
-ALPHA_THRESHOLD        = 50      # alpha below this → treated as transparent
+ALPHA_THRESHOLD        = 60      # alpha below this → treated as transparent
 SEED                   = 42
 BACKGROUND_COLOR       = None    # None = transparent; or (255,255,255) for white
 OUTLINE_ENABLED        = False
@@ -59,7 +59,7 @@ OUTLINE_THICKNESS      = 1.0     # multiplier of padding
 USE_CLUSTERING         = True
 CLUSTER_BATCH_SIZE     = 8
 SORT_BY_SIZE           = True    # sort images by non-transparent pixel area
-SORT_LARGE_BOTTOM      = False    # True → largest insects at the bottom of the bar
+SORT_LARGE_BOTTOM      = True    # True → largest insects at the bottom of the bar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,13 +80,60 @@ def load_image(path: Path, scale: float) -> Image.Image | None:
         return None
 
 
-def get_mask(img: Image.Image, padding: int = DEFAULT_PADDING) -> np.ndarray:
+def get_tight_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
+    """
+    Return (r0, c0, r1, c1) — the tight bounding box of non-transparent pixels.
+    Returns None if the image is fully transparent.
+    """
     alpha = np.array(img.split()[3])
-    mask  = alpha > ALPHA_THRESHOLD
+    rows  = np.any(alpha > ALPHA_THRESHOLD, axis=1)
+    cols  = np.any(alpha > ALPHA_THRESHOLD, axis=0)
+    if not rows.any():
+        return None
+    r0, r1 = int(np.argmax(rows)),  int(len(rows)  - 1 - np.argmax(rows[::-1]))
+    c0, c1 = int(np.argmax(cols)),  int(len(cols)  - 1 - np.argmax(cols[::-1]))
+    return r0, c0, r1 + 1, c1 + 1  # r1/c1 exclusive
+
+
+def get_mask(img: Image.Image, padding: int = DEFAULT_PADDING) -> tuple[np.ndarray, int, int]:
+    """
+    Return (mask, row_offset, col_offset) where mask is cropped to the tight
+    bounding box of non-transparent pixels (plus padding dilation).
+    row_offset / col_offset are where the top-left of the mask sits within the
+    original image, so the image can be alpha-composited at the correct position.
+    """
+    bbox = get_tight_bbox(img)
+    if bbox is None:
+        # Fully transparent — return a minimal mask
+        return np.zeros((1, 1), dtype=bool), 0, 0
+
+    r0, c0, r1, c1 = bbox
+
+    # Add a margin so dilation doesn't eat into neighbouring content
+    margin = padding + 1
+    r0c = max(0, r0 - margin)
+    c0c = max(0, c0 - margin)
+    r1c = min(img.height, r1 + margin)
+    c1c = min(img.width,  c1 + margin)
+
+    alpha  = np.array(img.split()[3])[r0c:r1c, c0c:c1c]
+    mask   = alpha > ALPHA_THRESHOLD
     if padding > 0:
         struct = np.ones((padding * 2 + 1, padding * 2 + 1), dtype=bool)
         mask   = binary_dilation(mask, structure=struct)
-    return mask
+        # Trim dilation back to tight content (no extra empty border rows/cols)
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        if rows.any():
+            tr0 = int(np.argmax(rows))
+            tr1 = int(len(rows) - 1 - np.argmax(rows[::-1])) + 1
+            tc0 = int(np.argmax(cols))
+            tc1 = int(len(cols) - 1 - np.argmax(cols[::-1])) + 1
+            mask  = mask[tr0:tr1, tc0:tc1]
+            r0c  += tr0
+            c0c  += tc0
+
+    return mask, r0c, c0c
 
 
 def get_image_area(path: Path) -> int:
@@ -122,13 +169,27 @@ def stamp_mask(canvas_occ: np.ndarray, insect_mask: np.ndarray,
 
 
 def place_image(canvas_rgba: np.ndarray, img: Image.Image,
-                row: int, col: int) -> None:
+                row: int, col: int,
+                img_row_off: int = 0, img_col_off: int = 0) -> None:
+    """
+    Alpha-composite img onto canvas at (row, col).
+    img_row_off / img_col_off shift which part of img is read, so the full
+    image (including transparent margins) is composited at the right position
+    even though the mask was cropped to a tight bbox.
+    The canvas position is adjusted so the insect appears at its natural location.
+    """
     H, W   = canvas_rgba.shape[:2]
     ih, iw = img.height, img.width
-    r0, c0 = max(0, row), max(0, col)
-    r1, c1 = min(H, row + ih), min(W, col + iw)
-    mr0, mc0 = r0 - row, c0 - col
-    mr1, mc1 = r1 - row, c1 - col
+    # canvas destination starts at (row - img_row_off, col - img_col_off)
+    # because the tight mask's top-left is img_row_off pixels into the image
+    dest_row = row - img_row_off
+    dest_col = col - img_col_off
+    r0, c0 = max(0, dest_row), max(0, dest_col)
+    r1, c1 = min(H, dest_row + ih), min(W, dest_col + iw)
+    if r1 <= r0 or c1 <= c0:
+        return
+    mr0, mc0 = r0 - dest_row, c0 - dest_col
+    mr1, mc1 = r1 - dest_row, c1 - dest_col
 
     src = np.array(img)[mr0:mr1, mc0:mc1].astype(float)
     dst = canvas_rgba[r0:r1, c0:c1].astype(float)
@@ -146,12 +207,15 @@ def place_image(canvas_rgba: np.ndarray, img: Image.Image,
 
 def draw_outline(canvas_rgba: np.ndarray, mask: np.ndarray,
                  row: int, col: int, thickness: int, color: tuple) -> None:
+    """row/col here are the canvas coords of the tight mask top-left."""
     struct       = np.ones((thickness * 2 + 1, thickness * 2 + 1), dtype=bool)
     outline_mask = binary_dilation(mask, structure=struct)
     H, W   = canvas_rgba.shape[:2]
     ih, iw = outline_mask.shape
     r0, c0 = max(0, row), max(0, col)
     r1, c1 = min(H, row + ih), min(W, col + iw)
+    if r1 <= r0 or c1 <= c0:
+        return
     mr0, mc0 = r0 - row, c0 - col
     mr1, mc1 = r1 - row, c1 - col
     region = outline_mask[mr0:mr1, mc0:mc1]
@@ -214,8 +278,13 @@ class BottomUpPacker:
             x += 1
         return None
 
-    def add(self, img: Image.Image, mask: np.ndarray,
+    def add(self, img: Image.Image,
+            mask: np.ndarray, mask_row_off: int, mask_col_off: int,
             outline: bool, outline_px: int, rng: random.Random) -> bool:
+        """
+        mask       — tight-bbox boolean mask (already dilated by padding)
+        mask_row_off / mask_col_off — pixel offset of mask top-left within img
+        """
         ih, iw = mask.shape
 
         # Insect wider than the canvas — skip (can never fit)
@@ -243,12 +312,13 @@ class BottomUpPacker:
             if x is None:
                 return False  # shouldn't happen after expansion, but be safe
 
-        # Place it
+        # Place it — mask canvas coords are (row, x); image is offset by mask offsets
         stamp_mask(self.occ, mask, row, x)
         if outline:
             color = (rng.randint(30, 255), rng.randint(30, 255), rng.randint(30, 255))
             draw_outline(self.canvas, mask, row, x, outline_px, color)
-        place_image(self.canvas, img, row, x)
+        place_image(self.canvas, img, row, x,
+                    img_row_off=mask_row_off, img_col_off=mask_col_off)
 
         self.shelf_x      = x + iw
         self.shelf_h      = max(self.shelf_h, ih)
@@ -501,12 +571,12 @@ def main():
             invalid += 1
             continue
 
-        mask = get_mask(img, padding=args.padding)
+        mask, mask_row_off, mask_col_off = get_mask(img, padding=args.padding)
         if not mask.any():
             invalid += 1
             continue
 
-        ok = packer.add(img, mask,
+        ok = packer.add(img, mask, mask_row_off, mask_col_off,
                         outline=args.outline,
                         outline_px=outline_px,
                         rng=rng)
