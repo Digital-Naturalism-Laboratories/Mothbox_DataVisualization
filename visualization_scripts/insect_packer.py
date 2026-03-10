@@ -61,7 +61,7 @@ USE_CLUSTERING     = False    # cluster images perceptually before packing
 CLUSTER_BATCH_SIZE = 8        # images per embedding batch
 VERTICAL_STACK        = False    # pack insects top-to-bottom constrained by width
 SORT_CLUSTERS_BY_SIZE = True     # sort clusters by image area before packing
-SORT_SIZE_DESCENDING  = False     # True = largest cluster first, False = smallest first
+SORT_SIZE_DESCENDING  = False     # True = largest insects on outside (packed last/spiral edge), False = largest in centre
 
 
 # ─────────────────────────────────────────────
@@ -422,7 +422,10 @@ def sort_clusters_by_size(label_path_pairs: list, descending: bool = True) -> tu
     def cluster_area(items):
         return get_image_area(items[0][1])
 
-    sorted_clusters = sorted(clusters.values(), key=cluster_area, reverse=descending)
+    # descending=True  → largest clusters on outside: sort smallest-first so small ones
+    #                        get packed first and land in the centre of the spiral.
+    # descending=False → largest clusters in centre: sort largest-first.
+    sorted_clusters = sorted(clusters.values(), key=cluster_area, reverse=(not descending))
 
     ordered       = [pair for cluster in sorted_clusters for pair in cluster] + noise
     sorted_paths  = [p for _, p in ordered]
@@ -510,10 +513,10 @@ def main():
                         help="Cluster images perceptually before packing so similar insects are grouped.")
     parser.add_argument("--vertical",       action="store_true", default=VERTICAL_STACK,
                         help="Pack insects in a vertical stack constrained by canvas width, top to bottom.")
-    parser.add_argument("--sort-by-size",     action="store_true", default=SORT_CLUSTERS_BY_SIZE,
-                        help="Sort clusters by the area of their first image before packing.")
-    parser.add_argument("--sort-ascending",   action="store_true",
-                        help="Sort clusters smallest-first instead of largest-first (only applies with --sort-by-size).")
+    parser.add_argument("--sort-by-size",     action=argparse.BooleanOptionalAction, default=SORT_CLUSTERS_BY_SIZE,
+                        help="Sort images by area before packing. (default: %(default)s)")
+    parser.add_argument("--sort-large-centre", action=argparse.BooleanOptionalAction, default=(not SORT_SIZE_DESCENDING),
+                        help="Largest insects in the spiral centre; False = largest on outside. (default: %(default)s)")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -534,7 +537,7 @@ def main():
     if args.cluster:
         if CLUSTERING_AVAILABLE:
             print("Clustering images before packing...")
-            do_descending = (not args.sort_ascending) if args.sort_by_size else True
+            do_descending = (not args.sort_large_centre) if args.sort_by_size else True
             paths, _ = cluster_and_sort_paths(paths, batch_size=CLUSTER_BATCH_SIZE,
                                               vis_dir=vis_dir,
                                               descending=do_descending)
@@ -544,6 +547,18 @@ def main():
     else:
         if not args.no_shuffle:
             rng.shuffle(paths)
+
+    # ── Sort by individual image size (spiral mode) ──
+    # In spiral mode the first image placed lands in the centre.
+    # Sorting largest-first puts big insects in the centre; smallest-first puts them outside.
+    if not args.vertical and args.sort_by_size:
+        print("Sorting images by size before packing...")
+        do_descending = not args.sort_large_centre
+        # For spiral: descending=True means small first (small to centre, large outside)
+        # descending=False means large first (large to centre, small outside)
+        paths = sorted(paths, key=get_image_area, reverse=(not do_descending))
+        direction = "largest → outside" if do_descending else "largest → centre"
+        print(f"  Size sort: {direction}")
 
     if args.limit:
         paths = paths[: args.limit]
@@ -625,7 +640,7 @@ def main():
 
     Image.fromarray(canvas_rgba, "RGBA").save(out_path, "PNG")
     print(f"\n✓ Saved → {out_path}")
-    print(f"  placed={placed}  |  invalid/transparent={invalid}  |  couldn't fit={no_fit}")    
+    print(f"  placed={placed}  |  invalid/transparent={invalid}  |  couldn't fit={no_fit}")
     print(f"  Total time: {time.time() - t0:.1f}s")
 
 
