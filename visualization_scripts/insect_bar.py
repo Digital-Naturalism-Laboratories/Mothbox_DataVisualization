@@ -59,7 +59,7 @@ OUTLINE_THICKNESS      = 1.0     # multiplier of padding
 USE_CLUSTERING         = True
 CLUSTER_BATCH_SIZE     = 8
 SORT_BY_SIZE           = True    # sort images by non-transparent pixel area
-SORT_LARGE_BOTTOM      = True    # True → largest insects at the bottom of the bar
+SORT_LARGE_BOTTOM      = False    # True → largest insects at the bottom of the bar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,11 +344,14 @@ def cluster_paths(paths, batch_size=8, vis_dir: Path = None):
     return paths, list(labels)
 
 
-def sort_by_cluster_then_size(paths, labels, large_bottom: bool):
+def sort_by_cluster_then_size(paths, labels, large_bottom: bool, sort_by_size: bool = True):
     """
     Group images by cluster label; sort clusters by their representative area.
     large_bottom=True  → big clusters placed first (they land at the bottom of the bar).
-    Noise points (label -1) are appended last.
+
+    If sort_by_size is True:
+      - Images within each named cluster are sorted by area (large_bottom order).
+      - Noise images (label -1) are also sorted by area before being appended last.
     """
     from collections import defaultdict
     clusters = defaultdict(list)
@@ -362,9 +365,21 @@ def sort_by_cluster_then_size(paths, labels, large_bottom: bool):
     def rep_area(items):
         return get_image_area(items[0])
 
-    # large_bottom → sort descending so big clusters come first (packed bottom)
+    # Sort clusters by the area of their representative (first) image
     ordered_clusters = sorted(clusters.values(), key=rep_area, reverse=large_bottom)
-    return [p for cluster in ordered_clusters for p in cluster] + noise
+
+    result = []
+    for cluster in ordered_clusters:
+        if sort_by_size:
+            cluster = sorted(cluster, key=get_image_area, reverse=large_bottom)
+        result.extend(cluster)
+
+    # Noise points last — sort by size too if requested
+    if sort_by_size:
+        noise = sorted(noise, key=get_image_area, reverse=large_bottom)
+    result.extend(noise)
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,7 +438,7 @@ def main():
         if CLUSTERING_AVAILABLE:
             print("Clustering images…")
             paths, labels = cluster_paths(paths, CLUSTER_BATCH_SIZE, vis_dir)
-            paths = sort_by_cluster_then_size(paths, labels, args.sort_large_bottom)
+            paths = sort_by_cluster_then_size(paths, labels, args.sort_large_bottom, sort_by_size=args.sort_by_size)
         else:
             print("⚠  Clustering deps missing — using random order.")
             rng.shuffle(paths)
