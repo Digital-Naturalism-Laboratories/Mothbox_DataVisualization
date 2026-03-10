@@ -47,7 +47,7 @@ INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\r
 # ─────────────────────────────────────────────
 DEFAULT_WIDTH      = 8000     # canvas width in pixels
 DEFAULT_HEIGHT     = 6000     # canvas height in pixels
-DEFAULT_SCALE      = 1.0      # scale factor applied to each insect image
+DEFAULT_SCALE      = .4      # scale factor applied to each insect image
 DEFAULT_PADDING    = 2        # extra transparent pixels around each insect mask
 MAX_ATTEMPTS       = 500      # placement attempts per image before giving up
 ALPHA_THRESHOLD    = 50       # alpha value below this → transparent (background)
