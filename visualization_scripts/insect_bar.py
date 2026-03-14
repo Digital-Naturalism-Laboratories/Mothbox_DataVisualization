@@ -45,11 +45,11 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # INPUT FOLDER  ← set this to your insects directory
 # ─────────────────────────────────────────────────────────────────────────────
-INPUT_FOLDER = r"C:\Users\andre\Desktop\Clear_Camilo_Bugs_BCI_Amour_Rainy_2025\rembg"
+INPUT_FOLDER = r"F:\Deployments\Panama\Hoya_163m_unrulyArao_2025-01-26\2025-01-27\patches\rembg"
 
 # ── Configuration defaults ────────────────────────────────────────────────────
-DEFAULT_WIDTH          = 5000    # canvas width in pixels (height is auto)
-DEFAULT_SCALE          = 0.4     # scale applied to each insect before packing
+DEFAULT_WIDTH          = 2000    # canvas width in pixels (height is auto)
+DEFAULT_SCALE          = 0.2     # scale applied to each insect before packing
 DEFAULT_PADDING        = 2       # extra transparent pixels around each silhouette
 ALPHA_THRESHOLD        = 60      # alpha below this → treated as transparent
 SEED                   = 42
