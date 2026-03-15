@@ -7,6 +7,7 @@ script_path = r"C:\Users\andre\Documents\GitHub\Mothbox_DataVisualization\visual
 # ── Folders to process ────────────────────────────────────────────────────────
 # Each entry is the path to a folder of rembg-processed insect images.
 input_paths = [
+    r"F:\Deployments\Panama\Hoya_119m_bothDeer_2025-01-26\2025-01-27\patches\rembg",
     r"F:\Deployments\Panama\Hoya_163m_unrulyArao_2025-01-26\2025-01-27\patches\rembg",
     r"F:\Deployments\Panama\Hoya_168m_doubleParina_2025-01-26\2025-01-27\patches\rembg",
     r"F:\Deployments\Panama\Hoya_277m_adeptTurca_2025-01-26\2025-01-27\patches\rembg",

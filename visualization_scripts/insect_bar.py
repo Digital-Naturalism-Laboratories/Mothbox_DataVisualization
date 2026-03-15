@@ -40,18 +40,18 @@ try:
     CLUSTERING_AVAILABLE = True
 except ImportError:
     CLUSTERING_AVAILABLE = False
-    print("⚠  torch / torchvision / timm / hdbscan not found — clustering disabled.")
+    print(" torch / torchvision / timm / hdbscan not found — clustering disabled.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INPUT FOLDER  ← set this to your insects directory
 # ─────────────────────────────────────────────────────────────────────────────
-INPUT_FOLDER = r"F:\Deployments\Panama\Hoya_163m_unrulyArao_2025-01-26\2025-01-27\patches\rembg"
+INPUT_FOLDER = r"F:\Deployments\Panama\Hoya_916m_layerMomoto_2025-01-26\2025-01-27\patches\rembg"
 
 # ── Configuration defaults ────────────────────────────────────────────────────
 DEFAULT_WIDTH          = 2000    # canvas width in pixels (height is auto)
 DEFAULT_SCALE          = 0.2     # scale applied to each insect before packing
 DEFAULT_PADDING        = 2       # extra transparent pixels around each silhouette
-ALPHA_THRESHOLD        = 60      # alpha below this → treated as transparent
+ALPHA_THRESHOLD        = 50      # alpha below this → treated as transparent
 SEED                   = 42
 BACKGROUND_COLOR       = None    # None = transparent; or (255,255,255) for white
 OUTLINE_ENABLED        = False
@@ -60,6 +60,7 @@ USE_CLUSTERING         = True
 CLUSTER_BATCH_SIZE     = 8
 SORT_BY_SIZE           = True    # sort images by non-transparent pixel area
 SORT_LARGE_BOTTOM      = True    # True → largest insects at the bottom of the bar
+INVERSE_UNCLUSTERED    = True    # Reverse noise-image sort so size gradient is continuous
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,14 +415,21 @@ def cluster_paths(paths, batch_size=8, vis_dir: Path = None):
     return paths, list(labels)
 
 
-def sort_by_cluster_then_size(paths, labels, large_bottom: bool, sort_by_size: bool = True):
+def sort_by_cluster_then_size(paths, labels, large_bottom: bool,
+                              sort_by_size: bool = True,
+                              inverse_unclustered: bool = False):
     """
     Group images by cluster label; sort clusters by their representative area.
     large_bottom=True  → big clusters placed first (they land at the bottom of the bar).
 
     If sort_by_size is True:
       - Images within each named cluster are sorted by area (large_bottom order).
-      - Noise images (label -1) are also sorted by area before being appended last.
+      - Noise images (label -1) are sorted by area and appended last.
+
+    If inverse_unclustered is True:
+      - Noise images are sorted in the OPPOSITE direction to clustered images,
+        so the size gradient continues smoothly rather than resetting.
+        e.g. if clusters go big→small upward, noise continues small→big upward.
     """
     from collections import defaultdict
     clusters = defaultdict(list)
@@ -433,9 +441,13 @@ def sort_by_cluster_then_size(paths, labels, large_bottom: bool, sort_by_size: b
             clusters[l].append(p)
 
     def rep_area(items):
-        return get_image_area(items[0])
+        # Use the median area across all images in the cluster so that one
+        # atypically small or large specimen can't misrank the whole group.
+        areas = sorted(get_image_area(p) for p in items)
+        mid   = len(areas) // 2
+        return areas[mid]
 
-    # Sort clusters by the area of their representative (first) image
+    # Sort clusters by median area of their members
     ordered_clusters = sorted(clusters.values(), key=rep_area, reverse=large_bottom)
 
     result = []
@@ -444,9 +456,10 @@ def sort_by_cluster_then_size(paths, labels, large_bottom: bool, sort_by_size: b
             cluster = sorted(cluster, key=get_image_area, reverse=large_bottom)
         result.extend(cluster)
 
-    # Noise points last — sort by size too if requested
+    # Noise points last — direction flipped if inverse_unclustered is set
     if sort_by_size:
-        noise = sorted(noise, key=get_image_area, reverse=large_bottom)
+        noise_descending = large_bottom if not inverse_unclustered else (not large_bottom)
+        noise = sorted(noise, key=get_image_area, reverse=noise_descending)
     result.extend(noise)
 
     return result
@@ -484,6 +497,11 @@ def main():
     parser.add_argument("--sort-large-bottom", action=argparse.BooleanOptionalAction,
                         default=SORT_LARGE_BOTTOM,
                         help="Largest insects at the bottom of the bar. (default: on)")
+    parser.add_argument("--inverse-unclustered", action=argparse.BooleanOptionalAction,
+                        default=INVERSE_UNCLUSTERED,
+                        help="Reverse sort order for noise/unclustered images so the size "
+                             "gradient continues smoothly from the clustered section. "
+                             "Output filename gets '_invUncLog' suffix. (default: on)")
     parser.add_argument("--no-shuffle",     action="store_true",
                         help="Disable default random shuffling (ignored if --cluster set).")
     args = parser.parse_args()
@@ -508,7 +526,9 @@ def main():
         if CLUSTERING_AVAILABLE:
             print("Clustering images…")
             paths, labels = cluster_paths(paths, CLUSTER_BATCH_SIZE, vis_dir)
-            paths = sort_by_cluster_then_size(paths, labels, args.sort_large_bottom, sort_by_size=args.sort_by_size)
+            paths = sort_by_cluster_then_size(paths, labels, args.sort_large_bottom,
+                                                         sort_by_size=args.sort_by_size,
+                                                         inverse_unclustered=args.inverse_unclustered)
         else:
             print("⚠  Clustering deps missing — using random order.")
             rng.shuffle(paths)
@@ -604,7 +624,8 @@ def main():
 
     cluster_tag = "_clustered" if args.cluster else ""
     size_tag    = f"_{'largebottom' if args.sort_large_bottom else 'smallbottom'}" if args.sort_by_size else ""
-    suffix      = f"_w{args.width}_s{args.scale}_p{args.padding}{cluster_tag}{size_tag}"
+    inv_tag     = "_invUncLog" if (args.cluster and args.inverse_unclustered) else ""
+    suffix      = f"_w{args.width}_s{args.scale}_p{args.padding}{cluster_tag}{size_tag}{inv_tag}"
 
     out_path = Path(args.output)
     out_path = vis_dir / out_path.with_stem(out_path.stem + suffix).name
